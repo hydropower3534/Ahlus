@@ -491,6 +491,25 @@ async def deletecase(ctx, case_id: int):
 
     await ctx.send(f"Case {case_id} has been deleted successfully.")
 
+# ---------------- WEB SERVER TO STAY ONLINE ----------------
+import aiohttp
+from aiohttp import web
+import asyncio
+
+async def handle(request):
+    return web.Response(text="Bot is alive!")
+
+app = web.Application()
+app.add_routes([web.get('/', handle)])
+
+# Run the webserver in background
+async def run_web():
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+
+asyncio.create_task(run_web())
 
 # ---------------- WICK AUTOMOD LOGGING (FULL) ----------------
 @bot.event
