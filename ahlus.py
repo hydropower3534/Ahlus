@@ -781,19 +781,7 @@ def run():
 
 Thread(target=run).start()
 
-# --- Discord bot setup ---
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("discord")
-
-@bot.event
-async def on_ready():
-    print(f'✅ Logged in as {bot.user}')
-
-print("Loaded commands:", [cmd.name for cmd in bot.commands])
 
 # --- Start bot ---
 if __name__ == "__main__":
