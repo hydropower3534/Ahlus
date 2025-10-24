@@ -491,25 +491,20 @@ async def deletecase(ctx, case_id: int):
 
     await ctx.send(f"Case {case_id} has been deleted successfully.")
 
-# ---------------- WEB SERVER TO STAY ONLINE ----------------
-import aiohttp
-from aiohttp import web
-import asyncio
+from flask import Flask
+from threading import Thread
 
-async def handle(request):
-    return web.Response(text="Bot is alive!")
+app = Flask('')
 
-app = web.Application()
-app.add_routes([web.get('/', handle)])
+@app.route('/')
+def home():
+    return "Bot is alive!"
 
-# Run the webserver in background
-async def run_web():
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
-    await site.start()
+def run():
+    app.run(host='0.0.0.0', port=8080)
 
-asyncio.create_task(run_web())
+t = Thread(target=run)
+t.start()
 
 # ---------------- WICK AUTOMOD LOGGING (FULL) ----------------
 @bot.event
