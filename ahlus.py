@@ -775,6 +775,9 @@ async def on_error(event, *args, **kwargs):
 
 # ---------------- RUN ----------------
 
+from webserver import keep_alive
+keep_alive()
+
 if __name__ == "__main__":
     try:
         bot.run(TOKEN)
