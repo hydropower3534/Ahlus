@@ -491,20 +491,7 @@ async def deletecase(ctx, case_id: int):
 
     await ctx.send(f"Case {case_id} has been deleted successfully.")
 
-from flask import Flask
-from threading import Thread
 
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-t = Thread(target=run)
-t.start()
 
 # ---------------- WICK AUTOMOD LOGGING (FULL) ----------------
 @bot.event
@@ -775,12 +762,40 @@ async def on_error(event, *args, **kwargs):
 
 # ---------------- RUN ----------------
 
-from webserver import keep_alive
-keep_alive()
+from flask import Flask
+from threading import Thread
+import os
+import discord
+from discord.ext import commands
+import logging
 
+# --- Flask webserver (keeps the bot alive) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+Thread(target=run).start()
+
+# --- Discord bot setup ---
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("discord")
+
+@bot.event
+async def on_ready():
+    print(f'✅ Logged in as {bot.user}')
+
+# --- Start bot ---
 if __name__ == "__main__":
     try:
-        bot.run(TOKEN)
-    except Exception:
+        bot.run(os.getenv("DISCORD_TOKEN"))
+    except Exception as e:
         logger.exception("Failed to start bot")
-
