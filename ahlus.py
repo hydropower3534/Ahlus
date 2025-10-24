@@ -793,6 +793,8 @@ logger = logging.getLogger("discord")
 async def on_ready():
     print(f'✅ Logged in as {bot.user}')
 
+print("Loaded commands:", [cmd.name for cmd in bot.commands])
+
 # --- Start bot ---
 if __name__ == "__main__":
     try:
