@@ -1,23 +1,17 @@
 import discord
 from discord.ext import commands
-from datetime import datetime, timedelta
 import asyncio
-import json
 import os
 import logging
-import traceback
+import asyncpg
+from datetime import datetime
 
 # ---------------- CONFIG ----------------
-import os
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1411582058282876972
 MOD_LOG_CHANNEL_ID = 1411631150304329728
 LOG_CHANNEL_ID = 1412769718162423843
 WELCOME_CHANNEL_ID = 1411583450112069672
-CASES_FILE = "cases.json"
-TEMPBANS_FILE = "tempbans.json"
-TEMPMUTES_FILE = "tempmutes.json"
-TEMP_TIMEOUTS_FILE = "temptimeouts.json"
 
 # Roles & IDs
 SUPREME_ID = 1261645939337203742
@@ -38,60 +32,189 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ---------------- PERSISTENCE HELPERS ----------------
-def ensure_file(path, default):
-    if not os.path.exists(path):
-        with open(path, "w") as f:
-            json.dump(default, f, indent=4)
+# ---------------- DATABASE SETUP ----------------
+db_pool: asyncpg.pool.Pool = None  # global pool
 
-def load_json(path):
-    ensure_file(path, {})
-    with open(path, "r") as f:
-        return json.load(f)
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(
+        dsn=os.getenv("DATABASE_URL"),  # e.g., Render Postgres URL
+        min_size=1,
+        max_size=10
+    )
+    async with db_pool.acquire() as conn:
+        # Cases table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cases (
+                case_id SERIAL PRIMARY KEY,
+                action TEXT NOT NULL,
+                user_id BIGINT NOT NULL,
+                moderator_id BIGINT NOT NULL,
+                reason TEXT,
+                duration TEXT,
+                timestamp TIMESTAMPTZ DEFAULT now()
+            );
+        """)
+        # Tempbans table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS tempbans (
+                user_id BIGINT PRIMARY KEY,
+                unban_ts DOUBLE PRECISION NOT NULL
+            );
+        """)
+        # Tempmutes table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS tempmutes (
+                user_id BIGINT PRIMARY KEY,
+                unmute_ts DOUBLE PRECISION NOT NULL
+            );
+        """)
+        # Temp timeouts table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS temptimeouts (
+                user_id BIGINT PRIMARY KEY,
+                untimeout_ts DOUBLE PRECISION NOT NULL
+            );
+        """)
 
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=4)
+# Call this in your main async entry point
+# await init_db()
 
-ensure_file(CASES_FILE, {"case_counter": 0, "cases": []})
-ensure_file(TEMPBANS_FILE, {})
-ensure_file(TEMPMUTES_FILE, {})
-ensure_file(TEMP_TIMEOUTS_FILE, {})
+# ---------------- CASE HELPERS ----------------
 
-CASE_DATA = load_json(CASES_FILE)
-TEMPBAN_DATA = load_json(TEMPBANS_FILE)
-TEMPMUTE_DATA = load_json(TEMPMUTES_FILE)
-TEMPTIMEOUT_DATA = load_json(TEMP_TIMEOUTS_FILE)
+async def add_case_record(
+    action: str,
+    user_id: int,
+    moderator_id: int,
+    reason: str,
+    duration: str | None = None
+) -> dict:
+    """
+    Insert a new moderation case into the database.
+    Returns the inserted case as a dict including case_id and timestamp.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO cases (action, user_id, moderator_id, reason, duration)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING case_id, action, user_id, moderator_id, reason, duration, timestamp;
+        """, action, user_id, moderator_id, reason, duration)
+        return dict(row)
+
+
+async def find_case(case_id: int) -> dict | None:
+    """
+    Fetch a single case by case_id.
+    Returns dict or None if not found.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM cases WHERE case_id=$1;", case_id)
+        return dict(row) if row else None
+
+
+async def get_user_cases(user_id: int) -> list[dict]:
+    """
+    Fetch all cases for a specific user, ordered by case_id.
+    Returns a list of dicts.
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM cases WHERE user_id=$1 ORDER BY case_id;", user_id)
+        return [dict(r) for r in rows]
+
+# ---------------- TEMP PUNISHMENT HELPERS ----------------
+
+# ---------------- TEMPBAN ----------------
+async def set_tempban(user_id: int, unban_ts: float):
+    """Set or update a temporary ban for a user."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO tempbans (user_id, unban_ts)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET unban_ts = EXCLUDED.unban_ts;
+        """, user_id, unban_ts)
+
+
+async def remove_tempban(user_id: int):
+    """Remove a temporary ban for a user."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM tempbans WHERE user_id=$1;", user_id)
+
+
+async def get_all_tempbans() -> list[dict]:
+    """Fetch all temporary bans."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM tempbans;")
+        return [dict(r) for r in rows]
+
+
+# ---------------- TEMPMUTE ----------------
+async def set_tempmute(user_id: int, unmute_ts: float):
+    """Set or update a temporary mute for a user."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO tempmutes (user_id, unmute_ts)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET unmute_ts = EXCLUDED.unmute_ts;
+        """, user_id, unmute_ts)
+
+
+async def remove_tempmute(user_id: int):
+    """Remove a temporary mute for a user."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM tempmutes WHERE user_id=$1;", user_id)
+
+
+async def get_all_tempmutes() -> list[dict]:
+    """Fetch all temporary mutes."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM tempmutes;")
+        return [dict(r) for r in rows]
+
+
+# ---------------- TIMEOUT ----------------
+async def set_timeout(user_id: int, untimeout_ts: float):
+    """Set or update a temporary timeout for a user."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO temptimeouts (user_id, untimeout_ts)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET untimeout_ts = EXCLUDED.untimeout_ts;
+        """, user_id, untimeout_ts)
+
+
+async def remove_timeout(user_id: int):
+    """Remove a temporary timeout for a user."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM temptimeouts WHERE user_id=$1;", user_id)
+
+
+async def get_all_timeouts() -> list[dict]:
+    """Fetch all temporary timeouts."""
+    async with db_pool.acquire() as conn:
+        rows = await db_pool.fetch("SELECT * FROM temptimeouts;")
+        return [dict(r) for r in rows]
 
 # ---------------- UTIL HELPERS ----------------
-def next_case_id():
-    CASE_DATA["case_counter"] = CASE_DATA.get("case_counter", 0) + 1
-    save_json(CASES_FILE, CASE_DATA)
-    return CASE_DATA["case_counter"]
 
-def add_case_record(action, user_id, moderator_id, reason, extra=None):
-    cid = next_case_id()
-    rec = {
-        "case_id": cid,
-        "action": action,
-        "user_id": user_id,
-        "moderator_id": moderator_id,
-        "reason": reason,
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-    if extra:
-        rec.update(extra)
-    CASE_DATA.setdefault("cases", []).append(rec)
-    save_json(CASES_FILE, CASE_DATA)
-    return rec
+# ---------------- CASE RECORD HELPERS ----------------
+async def add_case_record_db(action: str, user_id: int, moderator_id: int, reason: str, duration: str | None = None) -> dict:
+    """Add a new case to the database and return it."""
+    return await add_case_record(action, user_id, moderator_id, reason, duration)
 
-def find_case(case_id):
-    for c in CASE_DATA.get("cases", []):
-        if c.get("case_id") == case_id:
-            return c
-    return None
 
-async def safe_send_channel(channel_id, embed_or_msg):
+async def find_case_db(case_id: int) -> dict | None:
+    """Fetch a case by ID from the database."""
+    return await find_case(case_id)
+
+
+async def get_user_cases_db(user_id: int) -> list[dict]:
+    """Fetch all cases for a given user."""
+    return await get_user_cases(user_id)
+
+
+# ---------------- CHANNEL & DM HELPERS ----------------
+async def safe_send_channel(channel_id: int, embed_or_msg) -> bool:
+    """Send a message or embed to a channel, safely."""
     ch = bot.get_channel(channel_id)
     if ch is None:
         logger.warning(f"Channel {channel_id} not found or bot lacks access")
@@ -106,7 +229,9 @@ async def safe_send_channel(channel_id, embed_or_msg):
         logger.exception("Failed to send to channel %s", channel_id)
         return False
 
-async def send_dm(user: discord.User, action: str, reason: str, duration=None):
+
+async def send_dm(user: discord.User, action: str, reason: str, duration: str | None = None):
+    """Send a DM to a user about an action taken against them."""
     try:
         description = f"You have been {action} on Ahlus-Sunnah Wal-Jamā'ah.\n\nReason: {reason}"
         if duration:
@@ -116,28 +241,47 @@ async def send_dm(user: discord.User, action: str, reason: str, duration=None):
     except Exception:
         pass
 
-async def log_action_manual(action_name, target, reason, color_hex=0x00FF00, moderator=None, duration=None):
+
+# ---------------- MANUAL LOGGING ----------------
+async def log_action_manual(
+    action_name: str,
+    target,
+    reason: str,
+    color_hex: int = 0x00FF00,
+    moderator: discord.Member | None = None,
+    duration: str | None = None
+) -> int | None:
     """
-    A lightweight logger used by automation tasks where we may not have a ctx.
-    `target` may be a Member or User or an ID.
-    Returns the case_id (int).
+    Logs an action manually (without ctx), stores it in DB, and posts embed to MOD_LOG_CHANNEL.
+    Returns the case_id.
     """
     try:
         moderator_id = moderator.id if moderator else bot.user.id if bot.user else 0
         user_id = getattr(target, "id", int(target) if isinstance(target, (str, int)) else 0)
-        rec = add_case_record(action_name, user_id, moderator_id, reason, extra={"duration": duration})
-        # Try to resolve moderator and user objects for embed
-        moderator_obj = moderator if moderator else bot.user
+        
+        # Add to DB
+        rec = await add_case_record_db(action_name, user_id, moderator_id, reason, duration)
+
+        # Resolve objects for embed
+        moderator_obj = moderator or bot.user
         try:
-            if isinstance(target, discord.User) or isinstance(target, discord.Member):
+            if isinstance(target, (discord.User, discord.Member)):
                 user_obj = target
             else:
-                # fallback: fetch user
                 user_obj = await bot.fetch_user(user_id)
         except Exception:
             user_obj = moderator_obj or None
 
-        emb = create_case_embed(action_name, moderator_obj, user_obj or moderator_obj, reason, color_hex, rec["case_id"], duration)
+        emb = create_case_embed(
+            action_name,
+            moderator_obj,
+            user_obj or moderator_obj,
+            reason,
+            color_hex,
+            rec["case_id"],
+            duration,
+            timestamp=rec.get("timestamp")  # optional, from DB
+        )
         await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
         return rec["case_id"]
     except Exception:
@@ -145,13 +289,17 @@ async def log_action_manual(action_name, target, reason, color_hex=0x00FF00, mod
         return None
 
 # ---------------- EMBED FORMATTING ----------------
-def create_case_embed(action, moderator, user_obj, reason, color_hex, case_id, duration=None):
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+def create_case_embed(action, moderator, user_obj, reason, color_hex, case_id, duration=None, timestamp=None):
+    """
+    Create an embed for a moderation case.
+    If timestamp is provided, use it (from DB); otherwise, fallback to UTC now.
+    """
+    timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M UTC") if timestamp else datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     desc = (
         f"User: {user_obj.mention} — {user_obj} ({user_obj.id})\n"
         f"Reason: {reason}\n"
         f"Moderator: {moderator.mention} — {moderator} ({moderator.id})\n"
-        f"Time: {timestamp}"
+        f"Time: {timestamp_str}"
     )
     if duration:
         desc += f"\nDuration: {duration}"
@@ -163,17 +311,22 @@ def create_case_embed(action, moderator, user_obj, reason, color_hex, case_id, d
     emb.set_footer(text="Logged by Secretary of Ahlus-Sunnah")
     return emb
 
+
 def create_simple_embed(title, description, color_hex):
     emb = discord.Embed(title=title, description=description, color=color_hex)
     return emb
-
 
 
 # ---------------- PERMISSION LOGIC ----------------
 def _has_role_obj(member, role_name):
     return discord.utils.get(member.roles, name=role_name) is not None
 
+
 def can_moderate(executor: discord.Member, target: discord.Member, action_name: str):
+    """
+    Checks if executor can perform an action on target.
+    Returns (bool, reason_str_or_None)
+    """
     if target.id == SUPREME_ID:
         return False, "You cannot take moderation actions on the Supreme."
 
@@ -206,21 +359,49 @@ def can_moderate(executor: discord.Member, target: discord.Member, action_name: 
     # Supreme can do everything
     return True, None
 
-# ---------------- ACTION LOGGER ----------------
+# ---------------- ACTION LOGGER (ASYNC DB VERSION) ----------------
 async def log_action(ctx, action_name, member: discord.Member, reason, color, duration=None):
     allowed, msg = can_moderate(ctx.author, member, action_name)
     if not allowed:
         await ctx.send(msg)
         return None
 
-    rec = add_case_record(action_name, member.id, ctx.author.id, reason, extra={"duration": duration})
-    emb = create_case_embed(action_name, ctx.author, member, reason, color, rec["case_id"], duration)
-    await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
-    await send_dm(member, action_name, reason, duration)
-    return rec["case_id"]
+    try:
+        # Add record to DB
+        rec = await add_case_record(
+            action=action_name,
+            user_id=member.id,
+            moderator_id=ctx.author.id,
+            reason=reason,
+            duration=duration
+        )
 
-# ---------------- MOD COMMANDS (Fixed Version) ----------------
+        # Create embed using DB timestamp
+        emb = create_case_embed(
+            action=action_name,
+            moderator=ctx.author,
+            user_obj=member,
+            reason=reason,
+            color_hex=color,
+            case_id=rec["case_id"],
+            duration=duration,
+            timestamp=rec.get("timestamp")  # DB timestamp
+        )
 
+        # Send to mod log channel
+        await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
+
+        # DM the user
+        await send_dm(member, action_name, reason, duration)
+
+        return rec["case_id"]
+
+    except Exception:
+        logger.exception("Failed to log action")
+        await ctx.send("An error occurred while logging the action.")
+        return None
+
+# ---------------- MOD COMMANDS (DB Version) ----------------
 from datetime import datetime, timezone, timedelta
 
 @bot.command()
@@ -232,32 +413,37 @@ async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
 
 @bot.command()
 async def mute(ctx, member: discord.Member, duration_minutes: int = None, *, reason="No reason provided"):
-    case_id = await log_action(ctx, "Mute", member, reason, 0xFF0000, f"{duration_minutes} minutes" if duration_minutes else None)
+    duration_str = f"{duration_minutes} minutes" if duration_minutes else None
+    case_id = await log_action(ctx, "Mute", member, reason, 0xFF0000, duration_str)
     mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
     if mute_role and mute_role not in member.roles:
         await member.add_roles(mute_role, reason=reason)
+
     if duration_minutes:
         unmute_ts = datetime.now(timezone.utc).timestamp() + duration_minutes * 60
-        TEMPMUTE_DATA[str(member.id)] = unmute_ts
-        save_json(TEMPMUTES_FILE, TEMPMUTE_DATA)
+        await set_tempmute(member.id, unmute_ts)
         asyncio.create_task(schedule_unmute_task(member.id, unmute_ts))
+
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
     await ctx.send(f"{member.mention} successfully muted. {case_text}")
 
 
 @bot.command()
 async def timeout(ctx, member: discord.Member, duration_minutes: int = None, *, reason="No reason provided"):
-    case_id = await log_action(ctx, "Timeout", member, reason, 0xFFFF00, f"{duration_minutes} minutes" if duration_minutes else None)
+    duration_str = f"{duration_minutes} minutes" if duration_minutes else None
+    case_id = await log_action(ctx, "Timeout", member, reason, 0xFFFF00, duration_str)
     if not case_id:
         return
+
     try:
         until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes) if duration_minutes else None
         await member.edit(timed_out_until=until, reason=reason)
+
         if duration_minutes:
             untimeout_ts = datetime.now(timezone.utc).timestamp() + duration_minutes * 60
-            TEMPTIMEOUT_DATA[str(member.id)] = untimeout_ts
-            save_json(TEMP_TIMEOUTS_FILE, TEMPTIMEOUT_DATA)
+            await set_timeout(member.id, untimeout_ts)
             asyncio.create_task(schedule_timeout_task(member.id, untimeout_ts))
+
         await ctx.send(f"{member.mention} has been timed out. (Case #{case_id})")
     except discord.Forbidden:
         await ctx.send("I don’t have permission to timeout this member.")
@@ -318,7 +504,8 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
 
 @bot.command()
 async def tempban(ctx, member: discord.Member, duration_minutes: int, *, reason="No reason provided"):
-    case_id = await log_action(ctx, "TempBan", member, reason, 0xFF0000, f"{duration_minutes} minutes")
+    duration_str = f"{duration_minutes} minutes"
+    case_id = await log_action(ctx, "TempBan", member, reason, 0xFF0000, duration_str)
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
@@ -326,10 +513,11 @@ async def tempban(ctx, member: discord.Member, duration_minutes: int, *, reason=
         return
     except Exception:
         logger.exception("Tempban failed")
+
     unban_ts = datetime.now(timezone.utc).timestamp() + duration_minutes * 60
-    TEMPBAN_DATA[str(member.id)] = unban_ts
-    save_json(TEMPBANS_FILE, TEMPBAN_DATA)
+    await set_tempban(member.id, unban_ts)
     asyncio.create_task(schedule_unban_task(member.id, unban_ts))
+
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
     await ctx.send(f"{member.mention} successfully temp-banned for {duration_minutes} minutes. {case_text}")
 
@@ -340,8 +528,7 @@ async def unmute(ctx, member: discord.Member):
     mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
     if mute_role and mute_role in member.roles:
         await member.remove_roles(mute_role, reason="Unmute executed")
-    TEMPMUTE_DATA.pop(str(member.id), None)
-    save_json(TEMPMUTES_FILE, TEMPMUTE_DATA)
+    await remove_tempmute(member.id)
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
     await ctx.send(f"{member.mention} successfully unmuted. {case_text}")
 
@@ -350,8 +537,7 @@ async def unmute(ctx, member: discord.Member):
 async def removetimeout(ctx, member: discord.Member):
     case_id = await log_action(ctx, "TimeoutRemoved", member, "Action executed", 0x00FF00)
     await member.edit(timed_out_until=None, reason="Timeout removed by moderator")
-    TEMPTIMEOUT_DATA.pop(str(member.id), None)
-    save_json(TEMP_TIMEOUTS_FILE, TEMPTIMEOUT_DATA)
+    await remove_timeout(member.id)
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
     await ctx.send(f"{member.mention} timeout successfully removed. {case_text}")
 
@@ -374,65 +560,17 @@ async def unban(ctx, user: discord.User):
         return
     except Exception:
         logger.exception("Unban failed")
-    rec = add_case_record("Unban", user.id, ctx.author.id, "Action executed")
+
+    rec = await add_case_record("Unban", user.id, ctx.author.id, "Action executed")
     emb = create_case_embed("Unban", ctx.author, user, "Action executed", 0x00FF00, rec["case_id"])
     await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
     await send_dm(user, "Unban", "Action executed")
     case_text = f"(Case #{rec['case_id']})"
     await ctx.send(f"{user.mention} successfully unbanned. {case_text}")
 
+# ---------------- TEMP PUNISHMENT SCHEDULERS (Postgres Async) ----------------
 
-import asyncio
-import json
-
-# ---------------- TEMPBAN / MUTE / TIMEOUT SCHEDULERS & RESTORE ----------------
-import asyncio
-from datetime import datetime, timezone
-
-# ---------------- TEMP PUNISHMENT SCHEDULERS (Persistent Version) ----------------
-
-async def schedule_unmute_task(member_id: int, unmute_ts: float):
-    try:
-        now_ts = datetime.utcnow().timestamp()
-        sleep_time = max(0, unmute_ts - now_ts)
-        await asyncio.sleep(sleep_time)
-
-        guild = bot.get_guild(GUILD_ID)
-        if not guild:
-            return
-        member = guild.get_member(member_id)
-        if member:
-            mute_role = discord.utils.get(guild.roles, name="Muted")
-            if mute_role and mute_role in member.roles:
-                await member.remove_roles(mute_role, reason="Temporary mute expired")
-            TEMPMUTE_DATA.pop(str(member_id), None)
-            save_json(TEMPMUTES_FILE, TEMPMUTE_DATA)
-            case_id = await log_action_manual("Unmute", member, "Temporary mute expired", 0x00FF00)
-            await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{member.mention} automatically unmuted. (Case #{case_id})")
-    except Exception as e:
-        logger.exception(f"Failed unmute scheduler for {member_id}: {e}")
-
-
-async def schedule_timeout_task(member_id: int, timeout_ts: float):
-    try:
-        now_ts = datetime.utcnow().timestamp()
-        sleep_time = max(0, timeout_ts - now_ts)
-        await asyncio.sleep(sleep_time)
-
-        guild = bot.get_guild(GUILD_ID)
-        if not guild:
-            return
-        member = guild.get_member(member_id)
-        if member:
-            await member.edit(timed_out_until=None, reason="Temporary timeout expired")
-            TEMPTIMEOUT_DATA.pop(str(member_id), None)
-            save_json(TEMP_TIMEOUTS_FILE, TEMPTIMEOUT_DATA)
-            case_id = await log_action_manual("TimeoutRemoved", member, "Temporary timeout expired", 0x00FF00)
-            await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{member.mention} timeout automatically removed. (Case #{case_id})")
-    except Exception as e:
-        logger.exception(f"Failed timeout scheduler for {member_id}: {e}")
-
-
+# TEMPBAN
 async def schedule_unban_task(user_id: int, unban_ts: float):
     try:
         now_ts = datetime.utcnow().timestamp()
@@ -446,77 +584,137 @@ async def schedule_unban_task(user_id: int, unban_ts: float):
         if user:
             try:
                 await guild.unban(user, reason="Temporary ban expired")
-                TEMPBAN_DATA.pop(str(user_id), None)
-                save_json(TEMPBANS_FILE, TEMPBAN_DATA)
+                async with pool.acquire() as conn:
+                    await conn.execute("DELETE FROM tempbans WHERE user_id=$1", user_id)
+
                 case_id = await log_action_manual("Unban", user, "Temporary ban expired", 0x00FF00)
                 await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{user.mention} automatically unbanned. (Case #{case_id})")
             except discord.NotFound:
-                TEMPBAN_DATA.pop(str(user_id), None)
-                save_json(TEMPBANS_FILE, TEMPBAN_DATA)
+                async with pool.acquire() as conn:
+                    await conn.execute("DELETE FROM tempbans WHERE user_id=$1", user_id)
             except discord.Forbidden:
                 logger.warning(f"Cannot unban user {user_id}, missing permissions.")
-    except Exception as e:
-        logger.exception(f"Failed unban scheduler for {user_id}: {e}")
-
-# ---------------- RESTORE TASKS (Full Memory Version) ----------------
-def restore_tempban_tasks():
-    """Re-schedule unfinished tempbans after bot restart."""
-    for user_id_str, unban_ts in TEMPBAN_DATA.items():
-        try:
-            now_ts = datetime.utcnow().timestamp()
-            remaining = unban_ts - now_ts
-            if remaining > 0:
-                asyncio.create_task(schedule_unban_task(int(user_id_str), unban_ts))
-            else:
-                asyncio.create_task(schedule_unban_task(int(user_id_str), now_ts))  # execute immediately
-        except Exception as e:
-            logger.warning(f"Failed to restore tempban for user {user_id_str}: {e}")
+    except Exception:
+        logger.exception(f"Failed unban scheduler for {user_id}")
 
 
-def restore_tempmute_tasks():
-    """Re-schedule unfinished tempmutes after bot restart."""
-    for user_id_str, unmute_ts in TEMPMUTE_DATA.items():
-        try:
-            now_ts = datetime.utcnow().timestamp()
-            remaining = unmute_ts - now_ts
-            if remaining > 0:
-                asyncio.create_task(schedule_unmute_task(int(user_id_str), unmute_ts))
-            else:
-                asyncio.create_task(schedule_unmute_task(int(user_id_str), now_ts))  # execute immediately
-        except Exception as e:
-            logger.warning(f"Failed to restore tempmute for user {user_id_str}: {e}")
+# TEMPMUTE
+async def schedule_unmute_task(member_id: int, unmute_ts: float):
+    try:
+        sleep_time = max(0, unmute_ts - datetime.utcnow().timestamp())
+        await asyncio.sleep(sleep_time)
+
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+        member = guild.get_member(member_id)
+        if member:
+            mute_role = discord.utils.get(guild.roles, name="Muted")
+            if mute_role and mute_role in member.roles:
+                await member.remove_roles(mute_role, reason="Temporary mute expired")
+
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM tempmutes WHERE user_id=$1", member_id)
+
+            case_id = await log_action_manual("Unmute", member, "Temporary mute expired", 0x00FF00)
+            await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{member.mention} automatically unmuted. (Case #{case_id})")
+    except Exception:
+        logger.exception(f"Failed unmute scheduler for {member_id}")
 
 
-def restore_timeout_tasks():
-    """Re-schedule unfinished timeouts after bot restart."""
-    for user_id_str, untimeout_ts in TEMPTIMEOUT_DATA.items():
-        try:
-            now_ts = datetime.utcnow().timestamp()
-            remaining = untimeout_ts - now_ts
-            if remaining > 0:
-                asyncio.create_task(schedule_timeout_task(int(user_id_str), untimeout_ts))
-            else:
-                asyncio.create_task(schedule_timeout_task(int(user_id_str), now_ts))  # execute immediately
-        except Exception as e:
-            logger.warning(f"Failed to restore timeout for user {user_id_str}: {e}")
+# TIMEOUT
+async def schedule_timeout_task(member_id: int, timeout_ts: float):
+    try:
+        sleep_time = max(0, timeout_ts - datetime.utcnow().timestamp())
+        await asyncio.sleep(sleep_time)
 
-# ---------------- CASE COMMANDS ----------------
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+        member = guild.get_member(member_id)
+        if member:
+            await member.edit(timed_out_until=None, reason="Temporary timeout expired")
+
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM temptimeouts WHERE user_id=$1", member_id)
+
+            case_id = await log_action_manual("TimeoutRemoved", member, "Temporary timeout expired", 0x00FF00)
+            await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{member.mention} timeout automatically removed. (Case #{case_id})")
+    except Exception:
+        logger.exception(f"Failed timeout scheduler for {member_id}")
+
+
+# ---------------- RESTORE TASKS ----------------
+async def restore_tempbans():
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, unban_ts FROM tempbans")
+    for user_id, unban_ts in rows:
+        asyncio.create_task(schedule_unban_task(user_id, max(unban_ts, datetime.utcnow().timestamp())))
+
+async def restore_tempmutes():
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, unmute_ts FROM tempmutes")
+    for user_id, unmute_ts in rows:
+        asyncio.create_task(schedule_unmute_task(user_id, max(unmute_ts, datetime.utcnow().timestamp())))
+
+async def restore_timeouts():
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, untimeout_ts FROM temptimeouts")
+    for user_id, timeout_ts in rows:
+        asyncio.create_task(schedule_timeout_task(user_id, max(timeout_ts, datetime.utcnow().timestamp())))
+
+
+# ---------------- ADD TASK FUNCTIONS ----------------
+async def add_tempban(user_id: int, unban_ts: float):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO tempbans(user_id, unban_ts)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET unban_ts = EXCLUDED.unban_ts
+        """, user_id, unban_ts)
+    asyncio.create_task(schedule_unban_task(user_id, unban_ts))
+
+async def add_tempmute(user_id: int, unmute_ts: float):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO tempmutes(user_id, unmute_ts)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET unmute_ts = EXCLUDED.unmute_ts
+        """, user_id, unmute_ts)
+    asyncio.create_task(schedule_unmute_task(user_id, unmute_ts))
+
+async def add_timeout(user_id: int, timeout_ts: float):
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO temptimeouts(user_id, untimeout_ts)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET untimeout_ts = EXCLUDED.untimeout_ts
+        """, user_id, timeout_ts)
+    asyncio.create_task(schedule_timeout_task(user_id, timeout_ts))
+
+COOL_ROLE_ID = 1413810618359615488  # Only members with this role can use case commands
+
+def has_cool_role(member: discord.Member):
+    return member.get_role(COOL_ROLE_ID) is not None
+
+# ---------------- CASE COMMANDS (DB VERSION) ----------------
 
 @bot.command()
 async def cases(ctx, member: discord.Member):
     """Show all case IDs for a user"""
-    user_cases = [c for c in CASE_DATA.get("cases", []) if c.get("user_id") == member.id]
+    if not has_cool_role(ctx.author):
+        await ctx.send("❌ You do not have permission to use this command.")
+        return
+
+    user_cases = await get_user_cases_db(member.id)  # fetch from DB
     if not user_cases:
         await ctx.send(f"No cases found for {member.mention}.")
         return
 
-    # Build numbered list
-    lines = [f"{i+1}. Case {c['case_id']}" for i, c in enumerate(user_cases)]
-    msg = "\n".join(lines)
-
+    lines = [f"{i+1}. Case #{c['case_id']}" for i, c in enumerate(user_cases)]
     emb = discord.Embed(
         title=f"Cases for {member}",
-        description=msg,
+        description="\n".join(lines),
         color=discord.Color.blue()
     )
     await ctx.send(embed=emb)
@@ -524,20 +722,30 @@ async def cases(ctx, member: discord.Member):
 
 @bot.command()
 async def caseinfo(ctx, case_id: int):
-    """Show full info for a case (basically recreate mod-log embed)"""
-    case = find_case(case_id)
+    """Show detailed info for a single case"""
+    if not has_cool_role(ctx.author):
+        await ctx.send("❌ You do not have permission to use this command.")
+        return
+
+    case = await find_case_db(case_id)
     if not case:
         await ctx.send(f"No case found with ID {case_id}.")
         return
 
     guild = ctx.guild
-    user = guild.get_member(case["user_id"]) or await bot.fetch_user(case["user_id"])
-    mod = guild.get_member(case["moderator_id"]) or await bot.fetch_user(case["moderator_id"])
+    try:
+        user = guild.get_member(case["user_id"]) or await bot.fetch_user(case["user_id"])
+    except Exception:
+        user = None
+    try:
+        mod = guild.get_member(case["moderator_id"]) or await bot.fetch_user(case["moderator_id"])
+    except Exception:
+        mod = None
 
     emb = create_case_embed(
         action=case["action"],
-        moderator=mod,
-        user_obj=user,
+        moderator=mod or ctx.guild.me,
+        user_obj=user or ctx.guild.me,
         reason=case["reason"],
         color_hex=discord.Color.orange(),
         case_id=case["case_id"],
@@ -548,18 +756,20 @@ async def caseinfo(ctx, case_id: int):
 
 @bot.command()
 async def deletecase(ctx, case_id: int):
-    """Delete a case from the records (staff only)"""
-    case = find_case(case_id)
+    """Delete a case from the DB (staff only)"""
+    if not has_cool_role(ctx.author):
+        await ctx.send("❌ You do not have permission to use this command.")
+        return
+
+    case = await find_case_db(case_id)
     if not case:
         await ctx.send(f"No case found with ID {case_id}.")
         return
 
-    # Remove from CASE_DATA
-    CASE_DATA["cases"] = [c for c in CASE_DATA["cases"] if c["case_id"] != case_id]
-    save_json(CASES_FILE, CASE_DATA)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM cases WHERE case_id=$1;", case_id)
 
-    await ctx.send(f"Case {case_id} has been deleted successfully.")
-
+    await ctx.send(f"✅ Case #{case_id} has been deleted successfully.")
 
 # ---------------- SAY COMMAND ----------------
 
