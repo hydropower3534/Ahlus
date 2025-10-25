@@ -139,24 +139,6 @@ def create_simple_embed(title, description, color_hex):
     emb = discord.Embed(title=title, description=description, color=color_hex)
     return emb
 
-# ---------------- TEMPBAN / MUTE / TIMEOUT SCHEDULERS ----------------
-# (scheduling functions omitted for brevity in this snippet; same logic as original)
-
-async def schedule_unmute_task(user_id, unmute_ts):
-    await asyncio.sleep(max(0, unmute_ts - datetime.utcnow().timestamp()))
-    guild = bot.get_guild(GUILD_ID)
-    member = guild.get_member(user_id)
-    if member:
-        mute_role = discord.utils.get(guild.roles, name="Muted")
-        if mute_role in member.roles:
-            await member.remove_roles(mute_role, reason="Auto unmute (time expired)")
-
-
-async def schedule_unban_task(user_id, unban_ts):
-    await asyncio.sleep(max(0, unban_ts - datetime.utcnow().timestamp()))
-    guild = bot.get_guild(GUILD_ID)
-    user = await bot.fetch_user(user_id)
-    await guild.unban(user, reason="Auto unban (time expired)")
 
 
 # ---------------- PERMISSION LOGIC ----------------
@@ -209,7 +191,9 @@ async def log_action(ctx, action_name, member: discord.Member, reason, color, du
     await send_dm(member, action_name, reason, duration)
     return rec["case_id"]
 
-# ---------------- MOD COMMANDS (Always Send Verification) ----------------
+# ---------------- MOD COMMANDS (Fixed Version) ----------------
+
+from datetime import datetime, timezone, timedelta
 
 @bot.command()
 async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
@@ -222,49 +206,46 @@ async def warn(ctx, member: discord.Member, *, reason="No reason provided"):
 async def mute(ctx, member: discord.Member, duration_minutes: int = None, *, reason="No reason provided"):
     case_id = await log_action(ctx, "Mute", member, reason, 0xFF0000, f"{duration_minutes} minutes" if duration_minutes else None)
     mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
-    if mute_role:
+    if mute_role and mute_role not in member.roles:
         await member.add_roles(mute_role, reason=reason)
     if duration_minutes:
-        unmute_ts = datetime.utcnow().timestamp() + duration_minutes * 60
+        unmute_ts = datetime.now(timezone.utc).timestamp() + duration_minutes * 60
         TEMPMUTE_DATA[str(member.id)] = unmute_ts
         save_json(TEMPMUTES_FILE, TEMPMUTE_DATA)
         asyncio.create_task(schedule_unmute_task(member.id, unmute_ts))
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
     await ctx.send(f"{member.mention} successfully muted. {case_text}")
 
-from datetime import datetime, timedelta
 
 @bot.command()
 async def timeout(ctx, member: discord.Member, duration_minutes: int = None, *, reason="No reason provided"):
     case_id = await log_action(ctx, "Timeout", member, reason, 0xFFFF00, f"{duration_minutes} minutes" if duration_minutes else None)
     if not case_id:
         return
-
     try:
-        # make it timezone-aware (important!)
-        from datetime import timezone
         until = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes) if duration_minutes else None
-
         await member.edit(timed_out_until=until, reason=reason)
-
         if duration_minutes:
             untimeout_ts = datetime.now(timezone.utc).timestamp() + duration_minutes * 60
             TEMPTIMEOUT_DATA[str(member.id)] = untimeout_ts
             save_json(TEMP_TIMEOUTS_FILE, TEMPTIMEOUT_DATA)
-
+            asyncio.create_task(schedule_timeout_task(member.id, untimeout_ts))
         await ctx.send(f"{member.mention} has been timed out. (Case #{case_id})")
-
     except discord.Forbidden:
         await ctx.send("I don’t have permission to timeout this member.")
     except Exception as e:
         await ctx.send(f"Failed to timeout {member.mention}: `{e}`")
         logger.exception("Timeout error")
 
+
 @bot.command()
 async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
     case_id = await log_action(ctx, "Kick", member, reason, 0xFF4500)
     try:
         await member.kick(reason=reason)
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to kick this member.")
+        return
     except Exception:
         logger.exception("Kick failed")
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
@@ -272,25 +253,25 @@ async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
 
 
 @bot.command()
-@commands.has_role(1413810618359615488)  # Department of Justice
+@commands.has_role(1413810618359615488)
 async def vm(ctx, member: discord.Member):
     male_role = ctx.guild.get_role(1414269022945677353)
     member_role = ctx.guild.get_role(1413518414697463818)
     unverified_role = ctx.guild.get_role(1425815375714455622)
     await member.add_roles(male_role, member_role)
     await member.remove_roles(unverified_role)
-    await ctx.send(f"✅ {member.mention} successfully verified as **Male** and given the Member role.")
+    await ctx.send(f"✅ {member.mention} successfully verified as **Male**.")
 
 
 @bot.command()
-@commands.has_role(1413810618359615488)  # Department of Justice
+@commands.has_role(1413810618359615488)
 async def vf(ctx, member: discord.Member):
     female_role = ctx.guild.get_role(1414269196543721502)
     member_role = ctx.guild.get_role(1413518414697463818)
     unverified_role = ctx.guild.get_role(1425815375714455622)
     await member.add_roles(female_role, member_role)
     await member.remove_roles(unverified_role)
-    await ctx.send(f"✅ {member.mention} successfully verified as **Female** and given the Member role.")
+    await ctx.send(f"✅ {member.mention} successfully verified as **Female**.")
 
 
 @bot.command()
@@ -298,6 +279,9 @@ async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
     case_id = await log_action(ctx, "Ban", member, reason, 0x8A0303)
     try:
         await member.ban(reason=reason)
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to ban this member.")
+        return
     except Exception:
         logger.exception("Ban failed")
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
@@ -309,9 +293,12 @@ async def tempban(ctx, member: discord.Member, duration_minutes: int, *, reason=
     case_id = await log_action(ctx, "TempBan", member, reason, 0xFF0000, f"{duration_minutes} minutes")
     try:
         await member.ban(reason=reason)
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to ban this member.")
+        return
     except Exception:
-        logger.exception("Tempban ban failed")
-    unban_ts = datetime.utcnow().timestamp() + duration_minutes * 60
+        logger.exception("Tempban failed")
+    unban_ts = datetime.now(timezone.utc).timestamp() + duration_minutes * 60
     TEMPBAN_DATA[str(member.id)] = unban_ts
     save_json(TEMPBANS_FILE, TEMPBAN_DATA)
     asyncio.create_task(schedule_unban_task(member.id, unban_ts))
@@ -324,7 +311,7 @@ async def unmute(ctx, member: discord.Member):
     case_id = await log_action(ctx, "Unmute", member, "Action executed", 0x00FF00)
     mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
     if mute_role and mute_role in member.roles:
-        await member.remove_roles(mute_role, reason="Unmute command executed")
+        await member.remove_roles(mute_role, reason="Unmute executed")
     TEMPMUTE_DATA.pop(str(member.id), None)
     save_json(TEMPMUTES_FILE, TEMPMUTE_DATA)
     case_text = f"(Case #{case_id})" if case_id else "(Case #N/A)"
@@ -354,82 +341,136 @@ async def unban(ctx, user: discord.User):
         return
     try:
         await ctx.guild.unban(user)
+    except discord.Forbidden:
+        await ctx.send("I don’t have permission to unban this user.")
+        return
     except Exception:
         logger.exception("Unban failed")
     rec = add_case_record("Unban", user.id, ctx.author.id, "Action executed")
     emb = create_case_embed("Unban", ctx.author, user, "Action executed", 0x00FF00, rec["case_id"])
     await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
     await send_dm(user, "Unban", "Action executed")
-    case_text = f"(Case #{rec['case_id']})" if rec else "(Case #N/A)"
+    case_text = f"(Case #{rec['case_id']})"
     await ctx.send(f"{user.mention} successfully unbanned. {case_text}")
 
 
 import asyncio
 import json
 
-# ---------- TEMPORARY PUNISHMENT RESTORATION ----------
+# ---------------- TEMPBAN / MUTE / TIMEOUT SCHEDULERS & RESTORE ----------------
+import asyncio
+from datetime import datetime, timezone
 
-def restore_tempban_tasks():
-    """Re-schedule unfinished tempbans after restart."""
+# ---------------- TEMP PUNISHMENT SCHEDULERS (Persistent Version) ----------------
+
+async def schedule_unmute_task(member_id: int, unmute_ts: float):
     try:
-        with open("tempbans.json", "r") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return
+        now_ts = datetime.utcnow().timestamp()
+        sleep_time = max(0, unmute_ts - now_ts)
+        await asyncio.sleep(sleep_time)
 
-    for ban in data.get("active_bans", []):
-        user_id = ban.get("user_id")
-        guild_id = ban.get("guild_id")
-        end_time = ban.get("end_time")
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+        member = guild.get_member(member_id)
+        if member:
+            mute_role = discord.utils.get(guild.roles, name="Muted")
+            if mute_role and mute_role in member.roles:
+                await member.remove_roles(mute_role, reason="Temporary mute expired")
+            TEMPMUTE_DATA.pop(str(member_id), None)
+            save_json(TEMPMUTES_FILE, TEMPMUTE_DATA)
+            case_id = await log_action_manual("Unmute", member, "Temporary mute expired", 0x00FF00)
+            await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{member.mention} automatically unmuted. (Case #{case_id})")
+    except Exception as e:
+        logger.exception(f"Failed unmute scheduler for {member_id}: {e}")
 
-        if not all([user_id, guild_id, end_time]):
-            continue
 
-        remaining = datetime.datetime.fromisoformat(end_time) - datetime.datetime.utcnow()
-        if remaining.total_seconds() > 0:
-            asyncio.create_task(schedule_unban(guild_id, user_id, remaining.total_seconds()))
+async def schedule_timeout_task(member_id: int, timeout_ts: float):
+    try:
+        now_ts = datetime.utcnow().timestamp()
+        sleep_time = max(0, timeout_ts - now_ts)
+        await asyncio.sleep(sleep_time)
+
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+        member = guild.get_member(member_id)
+        if member:
+            await member.edit(timed_out_until=None, reason="Temporary timeout expired")
+            TEMPTIMEOUT_DATA.pop(str(member_id), None)
+            save_json(TEMP_TIMEOUTS_FILE, TEMPTIMEOUT_DATA)
+            case_id = await log_action_manual("TimeoutRemoved", member, "Temporary timeout expired", 0x00FF00)
+            await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{member.mention} timeout automatically removed. (Case #{case_id})")
+    except Exception as e:
+        logger.exception(f"Failed timeout scheduler for {member_id}: {e}")
+
+
+async def schedule_unban_task(user_id: int, unban_ts: float):
+    try:
+        now_ts = datetime.utcnow().timestamp()
+        sleep_time = max(0, unban_ts - now_ts)
+        await asyncio.sleep(sleep_time)
+
+        guild = bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+        user = await bot.fetch_user(user_id)
+        if user:
+            try:
+                await guild.unban(user, reason="Temporary ban expired")
+                TEMPBAN_DATA.pop(str(user_id), None)
+                save_json(TEMPBANS_FILE, TEMPBAN_DATA)
+                case_id = await log_action_manual("Unban", user, "Temporary ban expired", 0x00FF00)
+                await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{user.mention} automatically unbanned. (Case #{case_id})")
+            except discord.NotFound:
+                TEMPBAN_DATA.pop(str(user_id), None)
+                save_json(TEMPBANS_FILE, TEMPBAN_DATA)
+            except discord.Forbidden:
+                logger.warning(f"Cannot unban user {user_id}, missing permissions.")
+    except Exception as e:
+        logger.exception(f"Failed unban scheduler for {user_id}: {e}")
+
+# ---------------- RESTORE TASKS (Full Memory Version) ----------------
+def restore_tempban_tasks():
+    """Re-schedule unfinished tempbans after bot restart."""
+    for user_id_str, unban_ts in TEMPBAN_DATA.items():
+        try:
+            now_ts = datetime.utcnow().timestamp()
+            remaining = unban_ts - now_ts
+            if remaining > 0:
+                asyncio.create_task(schedule_unban_task(int(user_id_str), unban_ts))
+            else:
+                asyncio.create_task(schedule_unban_task(int(user_id_str), now_ts))  # execute immediately
+        except Exception as e:
+            logger.warning(f"Failed to restore tempban for user {user_id_str}: {e}")
 
 
 def restore_tempmute_tasks():
-    """Re-schedule unfinished tempmutes after restart."""
-    try:
-        with open("tempmutes.json", "r") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return
-
-    for mute in data.get("active_mutes", []):
-        user_id = mute.get("user_id")
-        guild_id = mute.get("guild_id")
-        end_time = mute.get("end_time")
-
-        if not all([user_id, guild_id, end_time]):
-            continue
-
-        remaining = datetime.datetime.fromisoformat(end_time) - datetime.datetime.utcnow()
-        if remaining.total_seconds() > 0:
-            asyncio.create_task(schedule_unmute(guild_id, user_id, remaining.total_seconds()))
+    """Re-schedule unfinished tempmutes after bot restart."""
+    for user_id_str, unmute_ts in TEMPMUTE_DATA.items():
+        try:
+            now_ts = datetime.utcnow().timestamp()
+            remaining = unmute_ts - now_ts
+            if remaining > 0:
+                asyncio.create_task(schedule_unmute_task(int(user_id_str), unmute_ts))
+            else:
+                asyncio.create_task(schedule_unmute_task(int(user_id_str), now_ts))  # execute immediately
+        except Exception as e:
+            logger.warning(f"Failed to restore tempmute for user {user_id_str}: {e}")
 
 
 def restore_timeout_tasks():
-    """Re-schedule unfinished timeouts after restart."""
-    try:
-        with open("timeouts.json", "r") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return
-
-    for timeout in data.get("active_timeouts", []):
-        user_id = timeout.get("user_id")
-        guild_id = timeout.get("guild_id")
-        end_time = timeout.get("end_time")
-
-        if not all([user_id, guild_id, end_time]):
-            continue
-
-        remaining = datetime.datetime.fromisoformat(end_time) - datetime.datetime.utcnow()
-        if remaining.total_seconds() > 0:
-            asyncio.create_task(schedule_timeout_removal(guild_id, user_id, remaining.total_seconds()))
+    """Re-schedule unfinished timeouts after bot restart."""
+    for user_id_str, untimeout_ts in TEMPTIMEOUT_DATA.items():
+        try:
+            now_ts = datetime.utcnow().timestamp()
+            remaining = untimeout_ts - now_ts
+            if remaining > 0:
+                asyncio.create_task(schedule_timeout_task(int(user_id_str), untimeout_ts))
+            else:
+                asyncio.create_task(schedule_timeout_task(int(user_id_str), now_ts))  # execute immediately
+        except Exception as e:
+            logger.warning(f"Failed to restore timeout for user {user_id_str}: {e}")
 
 # ---------------- CASE COMMANDS ----------------
 
