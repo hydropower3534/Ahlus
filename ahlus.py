@@ -933,44 +933,37 @@ async def on_error(event, *args, **kwargs):
 
 from flask import Flask
 from threading import Thread
+import asyncio
 import os
-import discord
-from discord.ext import commands
 import logging
+import traceback
 
-# --- Flask webserver (keeps the bot alive) ---
+# --- Flask webserver (keeps Render happy) ---
 app = Flask('')
 
 @app.route('/')
 def home():
     return "Bot is alive!"
 
-def run():
+def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
-Thread(target=run).start()
+Thread(target=run_flask, daemon=True).start()  # Daemon thread runs in background
 
-
-
-import asyncio
-
-# --- Run ---
-
-@bot.event
-async def on_ready():
+# --- Discord bot start ---
+async def main():
     try:
-        logger.info(f"[READY] Logged in as {bot.user} (ID: {bot.user.id})")
-        
-        # Restore temp punishments from DB
-        await restore_tempbans_from_db()
-        await restore_tempmutes_from_db()
-        await restore_timeouts_from_db()
+        # Initialize DB
+        await init_db()
+        logging.info("Database initialized successfully.")
 
-        # Log channel resolutions for debugging
-        for cid in (MOD_LOG_CHANNEL_ID, LOG_CHANNEL_ID, WELCOME_CHANNEL_ID):
-            ch = bot.get_channel(cid)
-            logger.info("Channel ID %s resolves to: %s", cid, ch)
+        # Start bot
+        await bot.start(os.getenv("DISCORD_TOKEN"))
 
     except Exception:
-        logger.exception("Unhandled exception in on_ready")
+        logging.exception("Failed to start bot")
         traceback.print_exc()
+
+# Run the Discord bot in main thread
+if __name__ == "__main__":
+    asyncio.run(main())
