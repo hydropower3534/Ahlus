@@ -586,13 +586,13 @@ async def schedule_unban_task(user_id: int, unban_ts: float):
         if user:
             try:
                 await guild.unban(user, reason="Temporary ban expired")
-                async with pool.acquire() as conn:
+                async with db_pool.acquire() as conn:
                     await conn.execute("DELETE FROM tempbans WHERE user_id=$1", user_id)
 
                 case_id = await log_action_manual("Unban", user, "Temporary ban expired", 0x00FF00)
                 await safe_send_channel(MOD_LOG_CHANNEL_ID, f"{user.mention} automatically unbanned. (Case #{case_id})")
             except discord.NotFound:
-                async with pool.acquire() as conn:
+                async with db_pool.acquire() as conn:
                     await conn.execute("DELETE FROM tempbans WHERE user_id=$1", user_id)
             except discord.Forbidden:
                 logger.warning(f"Cannot unban user {user_id}, missing permissions.")
@@ -615,7 +615,7 @@ async def schedule_unmute_task(member_id: int, unmute_ts: float):
             if mute_role and mute_role in member.roles:
                 await member.remove_roles(mute_role, reason="Temporary mute expired")
 
-            async with pool.acquire() as conn:
+            async with db_pool.acquire() as conn:
                 await conn.execute("DELETE FROM tempmutes WHERE user_id=$1", member_id)
 
             case_id = await log_action_manual("Unmute", member, "Temporary mute expired", 0x00FF00)
@@ -637,7 +637,7 @@ async def schedule_timeout_task(member_id: int, timeout_ts: float):
         if member:
             await member.edit(timed_out_until=None, reason="Temporary timeout expired")
 
-            async with pool.acquire() as conn:
+            async with db_pool.acquire() as conn:
                 await conn.execute("DELETE FROM temptimeouts WHERE user_id=$1", member_id)
 
             case_id = await log_action_manual("TimeoutRemoved", member, "Temporary timeout expired", 0x00FF00)
@@ -648,19 +648,19 @@ async def schedule_timeout_task(member_id: int, timeout_ts: float):
 
 # ---------------- RESTORE TASKS ----------------
 async def restore_tempbans():
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id, unban_ts FROM tempbans")
     for user_id, unban_ts in rows:
         asyncio.create_task(schedule_unban_task(user_id, max(unban_ts, datetime.utcnow().timestamp())))
 
 async def restore_tempmutes():
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id, unmute_ts FROM tempmutes")
     for user_id, unmute_ts in rows:
         asyncio.create_task(schedule_unmute_task(user_id, max(unmute_ts, datetime.utcnow().timestamp())))
 
 async def restore_timeouts():
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT user_id, untimeout_ts FROM temptimeouts")
     for user_id, timeout_ts in rows:
         asyncio.create_task(schedule_timeout_task(user_id, max(timeout_ts, datetime.utcnow().timestamp())))
@@ -668,7 +668,7 @@ async def restore_timeouts():
 
 # ---------------- ADD TASK FUNCTIONS ----------------
 async def add_tempban(user_id: int, unban_ts: float):
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO tempbans(user_id, unban_ts)
             VALUES ($1, $2)
@@ -677,7 +677,7 @@ async def add_tempban(user_id: int, unban_ts: float):
     asyncio.create_task(schedule_unban_task(user_id, unban_ts))
 
 async def add_tempmute(user_id: int, unmute_ts: float):
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO tempmutes(user_id, unmute_ts)
             VALUES ($1, $2)
@@ -686,7 +686,7 @@ async def add_tempmute(user_id: int, unmute_ts: float):
     asyncio.create_task(schedule_unmute_task(user_id, unmute_ts))
 
 async def add_timeout(user_id: int, timeout_ts: float):
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO temptimeouts(user_id, untimeout_ts)
             VALUES ($1, $2)
@@ -768,7 +768,7 @@ async def deletecase(ctx, case_id: int):
         await ctx.send(f"No case found with ID {case_id}.")
         return
 
-    async with pool.acquire() as conn:
+    async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM cases WHERE case_id=$1;", case_id)
 
     await ctx.send(f"✅ Case #{case_id} has been deleted successfully.")
