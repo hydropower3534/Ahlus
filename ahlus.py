@@ -950,9 +950,20 @@ Thread(target=run).start()
 
 
 
-# --- Start bot ---
+import asyncio
+
+# --- Start bot with DB init ---
 if __name__ == "__main__":
     try:
-        bot.run(os.getenv("DISCORD_TOKEN"))
+        async def main():
+            # Initialize the database pool
+            await init_db()
+            logger.info("Database initialized successfully.")
+
+            # Start the bot
+            await bot.start(os.getenv("DISCORD_TOKEN"))
+
+        asyncio.run(main())
+
     except Exception as e:
         logger.exception("Failed to start bot")
