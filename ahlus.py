@@ -1,10 +1,12 @@
-import discord
-from discord.ext import commands
-import asyncio
 import os
 import logging
-import asyncpg
+import asyncio
+import traceback
 from datetime import datetime
+
+import discord
+from discord.ext import commands
+import asyncpg
 
 # ---------------- CONFIG ----------------
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -952,18 +954,23 @@ Thread(target=run).start()
 
 import asyncio
 
-# --- Start bot with DB init ---
-if __name__ == "__main__":
+# --- Run ---
+
+@bot.event
+async def on_ready():
     try:
-        async def main():
-            # Initialize the database pool
-            await init_db()
-            logger.info("Database initialized successfully.")
+        logger.info(f"[READY] Logged in as {bot.user} (ID: {bot.user.id})")
+        
+        # Restore temp punishments from DB
+        await restore_tempbans_from_db()
+        await restore_tempmutes_from_db()
+        await restore_timeouts_from_db()
 
-            # Start the bot
-            await bot.start(os.getenv("DISCORD_TOKEN"))
+        # Log channel resolutions for debugging
+        for cid in (MOD_LOG_CHANNEL_ID, LOG_CHANNEL_ID, WELCOME_CHANNEL_ID):
+            ch = bot.get_channel(cid)
+            logger.info("Channel ID %s resolves to: %s", cid, ch)
 
-        asyncio.run(main())
-
-    except Exception as e:
-        logger.exception("Failed to start bot")
+    except Exception:
+        logger.exception("Unhandled exception in on_ready")
+        traceback.print_exc()
