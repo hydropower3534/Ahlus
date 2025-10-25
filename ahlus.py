@@ -116,6 +116,34 @@ async def send_dm(user: discord.User, action: str, reason: str, duration=None):
     except Exception:
         pass
 
+async def log_action_manual(action_name, target, reason, color_hex=0x00FF00, moderator=None, duration=None):
+    """
+    A lightweight logger used by automation tasks where we may not have a ctx.
+    `target` may be a Member or User or an ID.
+    Returns the case_id (int).
+    """
+    try:
+        moderator_id = moderator.id if moderator else bot.user.id if bot.user else 0
+        user_id = getattr(target, "id", int(target) if isinstance(target, (str, int)) else 0)
+        rec = add_case_record(action_name, user_id, moderator_id, reason, extra={"duration": duration})
+        # Try to resolve moderator and user objects for embed
+        moderator_obj = moderator if moderator else bot.user
+        try:
+            if isinstance(target, discord.User) or isinstance(target, discord.Member):
+                user_obj = target
+            else:
+                # fallback: fetch user
+                user_obj = await bot.fetch_user(user_id)
+        except Exception:
+            user_obj = moderator_obj or None
+
+        emb = create_case_embed(action_name, moderator_obj, user_obj or moderator_obj, reason, color_hex, rec["case_id"], duration)
+        await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
+        return rec["case_id"]
+    except Exception:
+        logger.exception("log_action_manual failed")
+        return None
+
 # ---------------- EMBED FORMATTING ----------------
 def create_case_embed(action, moderator, user_obj, reason, color_hex, case_id, duration=None):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -532,118 +560,132 @@ async def deletecase(ctx, case_id: int):
 
     await ctx.send(f"Case {case_id} has been deleted successfully.")
 
+# ---------------- WICK AUTOMOD LOGGING (PERSISTENT FIX) ----------------
+LAST_AUDIT_FILE = "last_audit.json"
 
+# Load last audit timestamp from file
+def load_last_audit():
+    if os.path.exists(LAST_AUDIT_FILE):
+        with open(LAST_AUDIT_FILE, "r") as f:
+            data = json.load(f)
+            ts = data.get("last_check")
+            if ts:
+                return datetime.fromisoformat(ts)
+    return datetime.utcnow()
 
-# ---------------- WICK AUTOMOD LOGGING (FULL) ----------------
-@bot.event
-async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
-    """
-    Logs any moderation action performed by Wick automod or other bots.
-    Detects duration for temp-mutes, temp-bans, and timeouts.
-    Automatically creates a case and sends an embed to the mod-log channel.
-    """
-    if not entry.user or not entry.user.bot:
+# Save last audit timestamp to file
+def save_last_audit(dt: datetime):
+    with open(LAST_AUDIT_FILE, "w") as f:
+        json.dump({"last_check": dt.isoformat()}, f)
+
+LAST_AUDIT_CHECK = load_last_audit()
+
+async def wick_audit_log_checker():
+    await bot.wait_until_ready()
+    global LAST_AUDIT_CHECK
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
         return
 
-    wick_name = str(entry.user.name).lower()
-    if "wick" not in wick_name:
-        return
-
-    if entry.guild.id != GUILD_ID:
-        return
-
-    target = entry.target
-    reason = entry.reason or "No reason provided."
-
-    # Map Discord AuditLogAction to action names
-    action_map = {
-        discord.AuditLogAction.ban: "Ban",
-        discord.AuditLogAction.kick: "Kick",
-        discord.AuditLogAction.member_update: "Timeout",
-        discord.AuditLogAction.member_role_update: "Mute/Unmute",
-        discord.AuditLogAction.message_delete: "Message Delete",
-    }
-
-    if entry.action not in action_map:
-        return
-
-    action_name = action_map[entry.action]
-
-    target_id = getattr(target, "id", 0)
-    target_display = str(target) if target else "Unknown target"
-
-    # Detect duration if applicable
-    duration_str = None
-    from datetime import datetime, timezone
-
-    if action_name == "Timeout" and isinstance(target, discord.Member):
-        if target.timed_out_until:
-            now = datetime.now(timezone.utc)
-            delta = target.timed_out_until - now
-            minutes = int(delta.total_seconds() // 60)
-            if minutes > 0:
-                duration_str = f"{minutes} minutes"
-
-    elif action_name == "Mute/Unmute" and isinstance(target, discord.Member):
-        # Optional: detect temp-mute role and infer duration if stored
-        # You can cross-check TEMPMUTE_DATA for temp-mutes
-        unmute_ts = TEMPMUTE_DATA.get(str(target.id))
-        if unmute_ts:
-            now_ts = datetime.now(timezone.utc).timestamp()
-            remaining = int((unmute_ts - now_ts) // 60)
-            if remaining > 0:
-                duration_str = f"{remaining} minutes"
-
-    elif action_name == "Ban" and isinstance(target, discord.User):
-        # Check TEMPBAN_DATA for temp-bans
-        unban_ts = TEMPBAN_DATA.get(str(target.id))
-        if unban_ts:
-            now_ts = datetime.now(timezone.utc).timestamp()
-            remaining = int((unban_ts - now_ts) // 60)
-            if remaining > 0:
-                duration_str = f"{remaining} minutes (TempBan)"
-
-    # Add to case system
-    rec = add_case_record(
-        action=action_name,
-        user_id=target_id,
-        moderator_id=entry.user.id,
-        reason=reason,
-        extra={"duration": duration_str}
-    )
-
-    # Embed color
-    color = discord.Color.orange()
-    if action_name == "Ban":
-        color = discord.Color.dark_red()
-    elif action_name == "Kick":
-        color = discord.Color.orange()
-    elif action_name in ("Timeout", "Mute/Unmute"):
-        color = discord.Color.yellow()
-
-    # Fetch user object
-    user_obj = target if isinstance(target, discord.Member) else None
-    if not user_obj and target_id:
+    while not bot.is_closed():
         try:
-            user_obj = await bot.fetch_user(target_id)
-        except Exception:
-            user_obj = None
+            async for entry in guild.audit_logs(limit=50, after=LAST_AUDIT_CHECK):
+                if not entry.user or not entry.user.bot:
+                    continue
 
-    moderator = entry.user
+                wick_name = str(entry.user.name).lower()
+                if "wick" not in wick_name:
+                    continue
 
-    emb = create_case_embed(
-        action=action_name,
-        moderator=moderator,
-        user_obj=user_obj or moderator,
-        reason=reason,
-        color_hex=color,
-        case_id=rec["case_id"],
-        duration=duration_str
-    )
+                target = entry.target
+                reason = entry.reason or "No reason provided."
 
-    # Send to mod-log
-    await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
-    logger.info(f"[Wick Automod] Logged {action_name} for {target_display} (Case #{rec['case_id']}) Duration: {duration_str or 'N/A'}")
+                action_map = {
+                    discord.AuditLogAction.ban: "Ban",
+                    discord.AuditLogAction.kick: "Kick",
+                    discord.AuditLogAction.member_update: "Timeout",
+                    discord.AuditLogAction.member_role_update: "Mute/Unmute",
+                    discord.AuditLogAction.message_delete: "Message Delete",
+                }
+
+                if entry.action not in action_map:
+                    continue
+
+                action_name = action_map[entry.action]
+
+                target_id = getattr(target, "id", 0)
+                target_display = str(target) if target else "Unknown target"
+
+                # Detect duration for temp actions
+                duration_str = None
+                if action_name == "Timeout" and isinstance(target, discord.Member):
+                    if target.timed_out_until:
+                        delta = target.timed_out_until - datetime.now(timezone.utc)
+                        minutes = int(delta.total_seconds() // 60)
+                        if minutes > 0:
+                            duration_str = f"{minutes} minutes"
+                elif action_name == "Mute/Unmute" and isinstance(target, discord.Member):
+                    unmute_ts = TEMPMUTE_DATA.get(str(target.id))
+                    if unmute_ts:
+                        remaining = int((unmute_ts - datetime.utcnow().timestamp()) // 60)
+                        if remaining > 0:
+                            duration_str = f"{remaining} minutes"
+                elif action_name == "Ban" and isinstance(target, discord.User):
+                    unban_ts = TEMPBAN_DATA.get(str(target.id))
+                    if unban_ts:
+                        remaining = int((unban_ts - datetime.utcnow().timestamp()) // 60)
+                        if remaining > 0:
+                            duration_str = f"{remaining} minutes (TempBan)"
+
+                # Log the case
+                rec = add_case_record(
+                    action=action_name,
+                    user_id=target_id,
+                    moderator_id=entry.user.id,
+                    reason=reason,
+                    extra={"duration": duration_str}
+                )
+
+                # Set color
+                color = discord.Color.orange()
+                if action_name == "Ban":
+                    color = discord.Color.dark_red()
+                elif action_name == "Kick":
+                    color = discord.Color.orange()
+                elif action_name in ("Timeout", "Mute/Unmute"):
+                    color = discord.Color.yellow()
+
+                user_obj = target if isinstance(target, discord.Member) else None
+                if not user_obj and target_id:
+                    try:
+                        user_obj = await bot.fetch_user(target_id)
+                    except Exception:
+                        user_obj = None
+
+                moderator = entry.user
+
+                emb = create_case_embed(
+                    action=action_name,
+                    moderator=moderator,
+                    user_obj=user_obj or moderator,
+                    reason=reason,
+                    color_hex=color,
+                    case_id=rec["case_id"],
+                    duration=duration_str
+                )
+
+                await safe_send_channel(MOD_LOG_CHANNEL_ID, emb)
+                logger.info(f"[Wick Automod] Logged {action_name} for {target_display} (Case #{rec['case_id']}) Duration: {duration_str or 'N/A'}")
+
+            LAST_AUDIT_CHECK = datetime.utcnow()
+            save_last_audit(LAST_AUDIT_CHECK)  # persist timestamp
+            await asyncio.sleep(10)
+        except Exception as e:
+            logger.exception(f"Error in Wick audit log checker: {e}")
+            await asyncio.sleep(30)
+
+# Start the checker
+asyncio.create_task(wick_audit_log_checker())
 
 # ---------------- SAY COMMAND ----------------
 
