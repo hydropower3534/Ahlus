@@ -930,45 +930,47 @@ async def on_error(event, *args, **kwargs):
 
 
 # ---------------- RUN ----------------
+
+import traceback
+import asyncio
+import os
+import logging
 from flask import Flask
 from threading import Thread
-import os
-import discord
-from discord.ext import commands
-import logging
-import asyncio
-import traceback
 
-app = Flask(__name__)
+logger = logging.getLogger("secretary")
+
+# --- Flask webserver (keeps the bot alive) ---
+app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is alive!", 200
+    return "Bot is alive!"
 
 def run_flask():
-    port = int(os.getenv("PORT", 8080))  # Render sets PORT automatically
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=8080)
 
-Thread(target=run_flask).start()
 
-@bot.event
-async def on_ready():
+# --- Discord bot startup (async) ---
+async def main():
     try:
-        logger.info(f"[READY] Logged in as {bot.user} (ID: {bot.user.id})")
+        # Initialize database connection pool
+        await init_db()
+        logger.info("✅ Database initialized successfully.")
 
-        # Restore from DB
-        await restore_tempbans_from_db()
-        await restore_tempmutes_from_db()
-        await restore_timeouts_from_db()
+        # Start Flask in a background thread
+        flask_thread = Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
+        logger.info("🌐 Flask webserver started.")
 
-        for cid in (MOD_LOG_CHANNEL_ID, LOG_CHANNEL_ID, WELCOME_CHANNEL_ID):
-            ch = bot.get_channel(cid)
-            logger.info(f"Channel {cid} resolves to: {ch}")
+        # Start Discord bot
+        await bot.start(os.getenv("DISCORD_TOKEN"))
 
-    except Exception:
-        logger.exception("Unhandled exception in on_ready")
-        traceback.print_exc()
+    except Exception as e:
+        logger.error("💥 Failed to start bot or Flask")
+        logger.error(traceback.format_exc())
 
-# ---- actually start the bot ----
+
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    asyncio.run(main())
